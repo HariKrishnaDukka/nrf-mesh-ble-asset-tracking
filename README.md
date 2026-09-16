@@ -879,6 +879,289 @@ Build directories should not be committed.
 
 ---
 
+# 20. Development Environment – Windows vs Linux
+
+The firmware is platform-independent at the source-code level. The same Zephyr/nRF Connect SDK projects can be developed on either Windows or Linux.
+
+The difference is the host development environment:
+
+```text
+                 SAME GITHUB SOURCE
+                        │
+             ┌──────────┴──────────┐
+             │                     │
+             ▼                     ▼
+        WINDOWS PC              LINUX PC
+             │                     │
+       VS Code / NCS          VS Code / NCS
+             │                     │
+             └──────────┬──────────┘
+                        ▼
+                 Same Zephyr
+                  Firmware
+                        │
+             ┌──────────┼──────────┐
+             ▼          ▼          ▼
+          Node A      Node B      Node C
+         nRF5340    nRF52833    nRF52833
+```
+
+## Windows
+
+Recommended host environment:
+
+```text
+Windows 10/11
+VS Code
+nRF Connect for VS Code
+PowerShell / Command Prompt
+nRF Connect SDK v2.7.0
+Zephyr v3.6.99-ncs2
+nrfutil
+PuTTY
+```
+
+Example project location:
+
+```text
+C:\Users\harik\Desktop\nrf-mesh-ble-asset-tracking\
+```
+
+Start the NCS toolchain:
+
+```powershell
+nrfutil sdk-manager toolchain launch --ncs-version v2.7.0 --terminal
+```
+
+Windows uses drive-letter paths such as:
+
+```text
+C:\ncs\v2.7.0
+C:\Users\harik\Desktop\...
+```
+
+Serial ports are normally exposed as:
+
+```text
+COM4
+COM5
+COM6
+COM7
+```
+
+Current development console mapping:
+
+```text
+Node A - nRF5340 : COM6
+Node B - nRF52833 : COM5
+```
+
+Open Node A:
+
+```cmd
+putty.exe -serial COM6 -sercfg 115200,8,n,1,N
+```
+
+Open Node B:
+
+```cmd
+putty.exe -serial COM5 -sercfg 115200,8,n,1,N
+```
+
+The COM number is not guaranteed to remain the same on another Windows installation. Check the actual device before opening the console.
+
+## Linux
+
+The same source tree can be used on Linux.
+
+Recommended host environment:
+
+```text
+Ubuntu/Linux
+VS Code
+nRF Connect SDK v2.7.0
+Zephyr v3.6.99-ncs2
+nrfutil
+West
+J-Link / Nordic programming tools
+screen or picocom
+```
+
+Example project location:
+
+```text
+~/nrf-mesh-ble-asset-tracking/
+```
+
+or:
+
+```text
+/home/<user>/nrf-mesh-ble-asset-tracking/
+```
+
+Linux uses POSIX paths instead of Windows drive-letter paths.
+
+For example:
+
+```text
+Windows:
+C:\Users\harik\Desktop\nrf-mesh-ble-asset-tracking
+
+Linux:
+~/nrf-mesh-ble-asset-tracking
+```
+
+Serial devices are normally exposed as:
+
+```text
+/dev/ttyACM0
+/dev/ttyACM1
+/dev/ttyACM2
+```
+
+Check connected devices:
+
+```bash
+nrfutil device list
+```
+
+For serial-port discovery:
+
+```bash
+ls /dev/ttyACM*
+```
+
+A console can be opened with:
+
+```bash
+screen /dev/ttyACM0 115200
+```
+
+or:
+
+```bash
+picocom -b 115200 /dev/ttyACM0
+```
+
+The actual `/dev/ttyACM*` number must be determined from the connected hardware.
+
+## Windows vs Linux Command Differences
+
+| Operation | Windows | Linux |
+|---|---|---|
+| Terminal | PowerShell / CMD | Bash |
+| Path format | `C:\Users\...\project` | `~/project` |
+| Serial port | `COM5` | `/dev/ttyACM0` |
+| Console | PuTTY | `screen` / `picocom` |
+| Build system | `west` | `west` |
+| Flash tool | `nrfutil` | `nrfutil` |
+| Source code | Same | Same |
+| `prj.conf` | Same | Same |
+| `CMakeLists.txt` | Same | Same |
+| NCS version | v2.7.0 | v2.7.0 |
+| Zephyr version | v3.6.99-ncs2 | v3.6.99-ncs2 |
+| Target hardware | Same | Same |
+
+## Important Rule
+
+Do not create separate firmware implementations just because the host operating system is different.
+
+The intended model is:
+
+```text
+Windows PC
+    │
+    │ Build / Flash
+    ▼
+Zephyr Firmware
+    │
+    ▼
+nRF5340 / nRF52833
+```
+
+and:
+
+```text
+Linux PC
+    │
+    │ Build / Flash
+    ▼
+Zephyr Firmware
+    │
+    ▼
+nRF5340 / nRF52833
+```
+
+The embedded firmware remains the same.
+
+Only the host-side commands, paths, serial device names, and development tools can differ.
+
+## Moving the Project from Windows to Linux
+
+When cloning the repository on Linux:
+
+```bash
+git clone <REPOSITORY_URL>
+cd nrf-mesh-ble-asset-tracking
+```
+
+Verify the development environment:
+
+```bash
+west --version
+arm-zephyr-eabi-gcc --version
+nrfutil --version
+```
+
+Then build the required node.
+
+The same procedure applies when moving from Linux back to Windows: clone the repository, enter the corresponding NCS environment, and build using the Windows paths.
+
+## Linux and P1 ULTRON
+
+Linux has an additional role in the larger architecture.
+
+The embedded A/B/C firmware runs on the Nordic devices:
+
+```text
+C nRF52833
+    │
+    │ BLE
+    ▼
+B nRF52833
+    │
+    │ Bluetooth Mesh
+    ▼
+A nRF5340
+```
+
+The higher-level controller can run on Linux:
+
+```text
+A nRF5340
+    │
+    │ UART / USB
+    ▼
+P1 ULTRON
+    │
+    ├── MQTT
+    └── Redis
+         │
+         ▼
+     P3 JARVIS
+```
+
+Therefore, Linux can be both:
+
+1. A development/build/flash host for the Zephyr firmware.
+2. The runtime host for the higher-level P1 ULTRON controller.
+
+These are separate roles.
+
+The nRF5340 continues to execute the embedded Bluetooth Mesh Provisioner/Controller firmware; Linux does not replace the nRF5340 firmware.
+
+---
+
 # 20. Building Node A
 
 Enter the NCS environment:
