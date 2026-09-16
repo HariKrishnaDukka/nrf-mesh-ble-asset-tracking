@@ -1,0 +1,10 @@
+build/
+*.elf
+*.map
+*.hex
+*.bin
+*.hex
+*.d
+*.o
+.west/
+.vscode/
