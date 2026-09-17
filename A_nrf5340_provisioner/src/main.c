@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
@@ -113,11 +114,189 @@ static const uint8_t app_key[16] = {
 #define VENDOR_OP_BEACON_REPORT \
     BT_MESH_MODEL_OP_3(0x02, VENDOR_COMPANY_ID)
 
-/*
- * A does not need to receive a vendor opcode for this test.
- * It only needs the vendor model to exist in its composition
- * so that the AppKey can be bound to it.
- */
+/* ------------------------------------------------------------
+ * BLE ASSET TABLE
+ *
+ * Master-side real-time asset state.
+ * ------------------------------------------------------------ */
+
+#define MAX_BLE_ASSETS       16U
+#define ASSET_ACTIVE_TIMEOUT_MS 3000U
+
+struct ble_asset {
+    bool valid;
+
+    uint16_t asset_id;
+
+    uint8_t mac[6];
+
+    uint16_t scanner_mesh_addr;
+
+    int8_t rssi;
+
+    uint16_t sequence;
+
+    uint32_t packets_seen;
+
+    uint32_t last_seen_ms;
+};
+
+static struct ble_asset asset_table[MAX_BLE_ASSETS];
+
+/* ------------------------------------------------------------
+ * Find existing asset
+ * ------------------------------------------------------------ */
+
+static int find_asset(
+    uint16_t asset_id,
+    const uint8_t *mac)
+{
+    for (uint32_t i = 0; i < MAX_BLE_ASSETS; i++) {
+
+        if (!asset_table[i].valid) {
+            continue;
+        }
+
+        if (asset_table[i].asset_id != asset_id) {
+            continue;
+        }
+
+        if (memcmp(asset_table[i].mac, mac, 6) == 0) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+
+/* ------------------------------------------------------------
+ * Find free asset table entry
+ * ------------------------------------------------------------ */
+
+static int find_free_asset(void)
+{
+    for (uint32_t i = 0; i < MAX_BLE_ASSETS; i++) {
+
+        if (!asset_table[i].valid) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+
+/* ------------------------------------------------------------
+ * Update BLE asset table
+ * ------------------------------------------------------------ */
+
+static void update_asset_table(
+    uint16_t asset_id,
+    const uint8_t *mac,
+    uint16_t scanner_mesh_addr,
+    int8_t rssi,
+    uint16_t sequence)
+{
+    uint32_t now_ms = k_uptime_get_32();
+
+    int index = find_asset(asset_id, mac);
+
+    if (index < 0) {
+        index = find_free_asset();
+    }
+
+    if (index < 0) {
+        printk("WARNING: BLE asset table full\n");
+        return;
+    }
+
+    struct ble_asset *asset = &asset_table[index];
+
+    if (!asset->valid) {
+
+        asset->valid = true;
+        asset->asset_id = asset_id;
+
+        memcpy(
+            asset->mac,
+            mac,
+            sizeof(asset->mac)
+        );
+
+        asset->packets_seen = 0U;
+    }
+
+    asset->scanner_mesh_addr = scanner_mesh_addr;
+    asset->rssi = rssi;
+    asset->sequence = sequence;
+    asset->packets_seen++;
+    asset->last_seen_ms = now_ms;
+}
+
+
+/* ------------------------------------------------------------
+ * Print current BLE asset table
+ * ------------------------------------------------------------ */
+
+static void print_asset_table(void)
+{
+    uint32_t now_ms = k_uptime_get_32();
+
+    printk("\n");
+    printk("============================================================\n");
+    printk("                    BLE ASSET TABLE\n");
+    printk("============================================================\n");
+
+    for (uint32_t i = 0; i < MAX_BLE_ASSETS; i++) {
+
+        struct ble_asset *asset = &asset_table[i];
+
+        if (!asset->valid) {
+            continue;
+        }
+
+        uint32_t age_ms =
+            now_ms - asset->last_seen_ms;
+
+        bool active =
+            (age_ms <= ASSET_ACTIVE_TIMEOUT_MS);
+
+        printk("\n");
+
+        printk("Asset ID       : 0x%04X\n",
+               asset->asset_id);
+
+        printk("BLE MAC        : %02X:%02X:%02X:%02X:%02X:%02X\n",
+               asset->mac[0],
+               asset->mac[1],
+               asset->mac[2],
+               asset->mac[3],
+               asset->mac[4],
+               asset->mac[5]);
+
+        printk("Detected By    : Mesh 0x%04X\n",
+               asset->scanner_mesh_addr);
+
+        printk("RSSI           : %d dBm\n",
+               asset->rssi);
+
+        printk("Sequence       : %u\n",
+               asset->sequence);
+
+        printk("Packets Seen   : %u\n",
+               asset->packets_seen);
+
+        printk("Last Seen      : %u ms ago\n",
+               age_ms);
+
+        printk("Status         : %s\n",
+               active ? "ACTIVE" : "TIMEOUT");
+    }
+
+    printk("\n");
+    printk("============================================================\n");
+}
 
 static int beacon_report_handler(const struct bt_mesh_model *model,
                                  struct bt_mesh_msg_ctx *ctx,
@@ -125,33 +304,98 @@ static int beacon_report_handler(const struct bt_mesh_model *model,
 {
     ARG_UNUSED(model);
 
-    if (buf->len != 5) {
+    /*
+     * BEACON_REPORT payload:
+     *
+     * Byte 0-5  : BLE MAC
+     * Byte 6-7  : Beacon ID
+     * Byte 8-9  : Sequence
+     * Byte 10   : RSSI
+     *
+     * Total = 11 bytes
+     */
+
+    if (buf->len != 11U) {
+
         printk("\n");
         printk("========================================\n");
         printk("INVALID BEACON REPORT\n");
-        printk("Expected : 5 bytes\n");
+        printk("Expected : 11 bytes\n");
         printk("Received : %u bytes\n", buf->len);
         printk("========================================\n");
+
         return 0;
     }
 
-    uint16_t beacon_node_id = net_buf_simple_pull_le16(buf);
-    uint16_t sequence       = net_buf_simple_pull_le16(buf);
-    int8_t rssi             = (int8_t)net_buf_simple_pull_u8(buf);
+    uint8_t mac[6];
+
+    mac[0] = net_buf_simple_pull_u8(buf);
+    mac[1] = net_buf_simple_pull_u8(buf);
+    mac[2] = net_buf_simple_pull_u8(buf);
+    mac[3] = net_buf_simple_pull_u8(buf);
+    mac[4] = net_buf_simple_pull_u8(buf);
+    mac[5] = net_buf_simple_pull_u8(buf);
+
+    uint16_t beacon_node_id =
+        net_buf_simple_pull_le16(buf);
+
+    uint16_t sequence =
+        net_buf_simple_pull_le16(buf);
+
+    int8_t rssi =
+        (int8_t)net_buf_simple_pull_u8(buf);
+
+
+    /* --------------------------------------------------------
+     * Update Master Asset Table
+     * -------------------------------------------------------- */
+
+    update_asset_table(
+        beacon_node_id,
+        mac,
+        ctx->addr,
+        rssi,
+        sequence
+    );
+
+
+    /* --------------------------------------------------------
+     * Real-time observation
+     * -------------------------------------------------------- */
 
     printk("\n");
     printk("========================================\n");
-    printk("       BEACON REPORT RECEIVED\n");
+    printk("       BLE ASSET OBSERVATION\n");
     printk("========================================\n");
 
-    printk("Source       : 0x%04X\n", ctx->addr);
-    printk("NetIdx       : 0x%04X\n", ctx->net_idx);
-    printk("AppIdx       : 0x%04X\n", ctx->app_idx);
-    printk("Beacon ID    : 0x%04X\n", beacon_node_id);
-    printk("Sequence     : %u\n", sequence);
-    printk("RSSI         : %d dBm\n", rssi);
+    printk("Asset ID       : 0x%04X\n",
+           beacon_node_id);
+
+    printk("BLE MAC        : %02X:%02X:%02X:%02X:%02X:%02X\n",
+           mac[0],
+           mac[1],
+           mac[2],
+           mac[3],
+           mac[4],
+           mac[5]);
+
+    printk("Detected By    : Mesh 0x%04X\n",
+           ctx->addr);
+
+    printk("RSSI           : %d dBm\n",
+           rssi);
+
+    printk("Sequence       : %u\n",
+           sequence);
+
+    printk("Mesh NetIdx    : 0x%04X\n",
+           ctx->net_idx);
+
+    printk("Mesh AppIdx    : 0x%04X\n",
+           ctx->app_idx);
 
     printk("========================================\n");
+
 
     return 0;
 }
@@ -159,7 +403,7 @@ static int beacon_report_handler(const struct bt_mesh_model *model,
 static const struct bt_mesh_model_op vendor_ops[] = {
     {
         VENDOR_OP_BEACON_REPORT,
-        BT_MESH_LEN_EXACT(5),
+        BT_MESH_LEN_EXACT(11),
         beacon_report_handler,
     },
 
@@ -254,7 +498,6 @@ static bool provisioning_started;
  * Actual address assigned to B by the provisioner.
  */
 static uint16_t provisioned_b_addr;
-
 
 /* ------------------------------------------------------------
  * Dedicated Configuration Workqueue
@@ -1056,10 +1299,13 @@ int main(void)
 
     while (1) {
 
-        printk("A Provisioner alive\n");
+    printk("\n");
+    printk("A Provisioner alive\n");
 
-        k_sleep(K_SECONDS(5));
-    }
+    print_asset_table();
+
+    k_sleep(K_SECONDS(5));
+}
 
     return 0;
 }
